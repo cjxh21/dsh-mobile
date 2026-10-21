@@ -1,6 +1,6 @@
 import { Children, type ReactElement, type ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { apply, CONTROL_STYLES } from '../src/client.js'
+import { apply, CONTROL_STYLES, mobileAccessInSettings, setMobileAccessInSettings } from '../src/client.js'
 
 class FakeElement extends EventTarget {
   readonly children: FakeElement[] = []
@@ -82,7 +82,8 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-function installFooter(locale = 'en-US', hostname = 'localhost') {
+function installFooter(locale = 'en-US', hostname = 'localhost', inSettings = true) {
+  setMobileAccessInSettings(inSettings)
   vi.useFakeTimers()
   const document = new FakeDocument()
   document.documentElement.lang = locale
@@ -91,6 +92,8 @@ function installFooter(locale = 'en-US', hostname = 'localhost') {
   const disposeSlot = vi.fn()
   const injectSlot = vi.fn((_name: string, install: () => () => void) => install())
   let renderer: ((wide: boolean) => ReactElement<TriggerProps>) | undefined
+  let settingsRenderer: (() => ReactElement) | undefined
+  let settingsOptions: Record<string, unknown> | undefined
 
   vi.stubGlobal('document', document)
   vi.stubGlobal('window', window)
@@ -112,6 +115,12 @@ function installFooter(locale = 'en-US', hostname = 'localhost') {
     slots: {
       inject: injectSlot,
       register(options, component) {
+        if (mobileAccessInSettings()) {
+          expect(options).toMatchObject({ name: 'settings.section', id: 'dsh-mobile-access' })
+          settingsOptions = options
+          settingsRenderer = component as unknown as () => ReactElement
+          return disposeSlot
+        }
         expect(options).toMatchObject({ name: 'sidebar.footer.action', id: 'dsh-mobile' })
         renderer = wide => component({ wide } as never) as ReactElement<TriggerProps>
         return disposeSlot
@@ -119,15 +128,18 @@ function installFooter(locale = 'en-US', hostname = 'localhost') {
     },
   })
 
+
   return {
     document,
     disconnect,
     disposeSlot,
     injectSlot,
+    get settingsOptions() { return settingsOptions },
     render(wide: boolean): ReactElement<TriggerProps> {
       if (renderer === undefined) throw new Error('Mobile Access footer was not registered')
       return renderer(wide)
     },
+
     mount(wide: boolean) {
       const tree = this.render(wide)
       const button = new FakeElement('button')
@@ -150,8 +162,7 @@ function declarations(selector: string): Record<string, string> {
   }))
 }
 
-describe('desktop Mobile Access footer', () => {
-  it('shares the footer row and preserves the compact rail target', () => {
+describe('desktop Mobile Access entry', () => {  it('shares the footer row and preserves the compact rail target', () => {
     expect(declarations('.dsh-mobile-control__trigger')).toMatchObject({
       'box-sizing': 'border-box',
       flex: '1 1 auto',
@@ -178,7 +189,6 @@ describe('desktop Mobile Access footer', () => {
       'border-radius': '50%',
     })
   })
-
   it('uses theme tokens for hover, pressed, expanded, and visible keyboard focus', () => {
     expect(declarations('.dsh-mobile-control__trigger:hover').background).toBe('var(--dsw-alias-interactive-bg-hover,#f1f3f6)')
     expect(declarations('.dsh-mobile-control__trigger:active,.dsh-mobile-control__trigger[aria-expanded="true"]').background).toBe('var(--dsw-alias-interactive-bg-active,#e8ebf0)')
@@ -194,7 +204,7 @@ describe('desktop Mobile Access footer', () => {
     ['zh-CN', '移动访问'],
     ['it-IT', 'Accesso mobile'],
   ])('keeps a localized accessible name and the same vector icon in both widths for %s', (locale, label) => {
-    const footer = installFooter(locale)
+    const footer = installFooter(locale, 'localhost', false)
     expect(footer.injectSlot).toHaveBeenCalledExactlyOnceWith('sidebar.footer.action', expect.any(Function))
     for (const wide of [true, false]) {
       const tree = footer.render(wide)
@@ -217,9 +227,8 @@ describe('desktop Mobile Access footer', () => {
       if (wide) expect(children[1]?.props.children).toBe(label)
     }
   })
-
   it('keeps expanded state in sync when the open panel trigger is remounted as a rail', () => {
-    const footer = installFooter()
+    const footer = installFooter('en-US', 'localhost', false)
     const wide = footer.mount(true)
     const panel = footer.document.querySelector('.dsh-mobile-control__panel')
     expect(panel?.id).toBe(wide.tree.props['aria-controls'])
@@ -246,15 +255,13 @@ describe('desktop Mobile Access footer', () => {
     expect(panel?.hidden).toBe(true)
     expect(rail.button.getAttribute('aria-expanded')).toBe('false')
   })
-
   it('registers the desktop footer on a private LAN address', () => {
-    const footer = installFooter('zh-CN', '192.168.50.23')
+    const footer = installFooter('zh-CN', '192.168.50.23', false)
     expect(footer.injectSlot).toHaveBeenCalledExactlyOnceWith('sidebar.footer.action', expect.any(Function))
     expect(footer.render(true).props).toMatchObject({ 'aria-label': '移动访问', title: '移动访问' })
   })
-
   it('reflects outside dismissal and removes its panel, styles, and registration on disposal', () => {
-    const footer = installFooter()
+    const footer = installFooter('en-US', 'localhost', false)
     const { button } = footer.mount(true)
     button.dispatchEvent(new Event('click'))
     const outside = new Event('pointerdown')
@@ -272,3 +279,21 @@ describe('desktop Mobile Access footer', () => {
     expect(footer.disconnect).toHaveBeenCalledOnce()
   })
 })
+
+describe('desktop Mobile Access settings entry (default path)', () => {
+    /* 2026-10-05 default entry: the sidebar no longer shows the trigger;
+       it becomes one row inside Settings. This guards the default path:
+       which slot is registered, and that the footer slot stays unused. */
+    it('registers the settings row instead of the sidebar footer slot', () => {
+      const footer = installFooter('zh-CN', 'localhost', true)
+      expect(footer.injectSlot).toHaveBeenCalledExactlyOnceWith('settings.section', expect.any(Function))
+      expect(footer.settingsOptions).toMatchObject({ name: 'settings.section', id: 'dsh-mobile-access', label: '移动访问' })
+    })
+
+    it('never registers the footer slot while the settings entry is active', () => {
+      const footer = installFooter('en-US', 'localhost', true)
+      const names = footer.injectSlot.mock.calls.map(call => call[0])
+      expect(names).toEqual(['settings.section'])
+      expect(names).not.toContain('sidebar.footer.action')
+    })
+  })

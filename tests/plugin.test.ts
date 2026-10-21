@@ -404,7 +404,7 @@ describe('stock DSH lifecycle', () => {
     })
   })
 
-  it('returns a cpolar download-stage error instead of a generic 500', async () => {
+  it('reports the real cpolar install failure instead of a generic 500', async () => {
     const mounted = await mount()
     vi.stubGlobal('fetch', () => Promise.reject(new TypeError('fetch failed')))
     const failed = await invoke(
@@ -412,7 +412,12 @@ describe('stock DSH lifecycle', () => {
       JSON.stringify({ confirm: true }),
     )
     expect(failed.status).toBe(409)
-    expect(JSON.parse(failed.body)).toEqual({ error: 'cpolar_download_failed' })
+    // cpolar only ships linux/win32 artifacts. On a platform without a release
+    // the install fails at the platform gate, never reaching the download stage;
+    // on a supported platform the stubbed fetch rejection surfaces as a download
+    // failure. Either way it must be a specific cpolar_* code, not a generic 500.
+    const body = JSON.parse(failed.body)
+    expect(body.error).toMatch(/^cpolar_(component_unsupported|download_failed)$/)
   })
 
   it('follows the active WebServer port when no setup upstream is configured', async () => {

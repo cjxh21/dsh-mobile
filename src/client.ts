@@ -207,6 +207,18 @@ export function mobileBackBlockedMessage(locale: MobileControlLocale): string {
   return messages[locale]
 }
 
+let mobileAccessInSettingsFlag = true
+
+/** 移动访问入口是否放在设置页而不是侧栏 footer。默认 true（2026-10-05 起）。 */
+export function mobileAccessInSettings(): boolean {
+  return mobileAccessInSettingsFlag
+}
+
+/** 测试专用：在两条入口路径之间切换。false 即恢复侧栏 footer 入口（兜底开关）。 */
+export function setMobileAccessInSettings(value: boolean): void {
+  mobileAccessInSettingsFlag = value
+}
+
 /** Remount one plugin-owned surface when DSH changes the document language. */
 export function installDshLanguageBoundSurface(install: () => () => void): () => void {
   let locale = selectedMobileControlLocale()
@@ -4208,7 +4220,7 @@ export function apply(ctx: ClientContext): void {
          用的是同一个 control.toggle，行为完全一致。
          ⚠ 兜底：MOBILE_ACCESS_IN_SETTINGS 改回 false 即恢复侧栏入口
          （两者二选一，不会同时出现）。 */
-      const MOBILE_ACCESS_IN_SETTINGS = true
+      const MOBILE_ACCESS_IN_SETTINGS = mobileAccessInSettings()
       const triggerButton = (wide: boolean) => createElement('button', {
         'aria-expanded': control.isOpen(),
         'aria-controls': CONTROL_PANEL_ID,
