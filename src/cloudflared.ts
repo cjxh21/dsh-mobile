@@ -27,6 +27,15 @@ const NAMED_STARTUP_ROUNDS = 5
 const CLOUDFLARED_HOST_SUFFIX = '.trycloudflare.com'
 
 /**
+ * Failure-restart backoff for a remembered-enabled tunnel. Early retries are
+ * quick because most real-world failures are transient (sleep/wake, Wi-Fi
+ * handoff, DNS not ready); later retries settle into a slow pulse so a
+ * persistent fault never becomes a busy loop. The schedule resets once the
+ * tunnel reaches `ready`.
+ */
+const RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 60_000, 300_000]
+
+/**
  * Subdomains Cloudflare reserves for its own control plane.
  *
  * The quick-tunnel banner prints `https://api.trycloudflare.com` (the registration API) before it
@@ -199,6 +208,8 @@ export class CloudflaredController implements RemoteProviderController {
   private queue: Promise<void> = Promise.resolve()
   private startupTimer: NodeJS.Timeout | undefined
   private startupRounds = 0
+  private retryTimer: NodeJS.Timeout | undefined
+  private retryAttempts = 0
 
   constructor(private readonly options: CloudflaredControllerOptions) {
     if (!isAbsolute(options.executable)) {
@@ -314,6 +325,9 @@ export class CloudflaredController implements RemoteProviderController {
           ? (named === undefined ? 'cloudflared_port_unavailable' : 'cloudflared_tunnel_port_unavailable')
           : 'cloudflared_port_reservation_failed',
       })
+      // A lingering previous DSH process is the common EADDRINUSE cause; the
+      // port usually frees moments later, so keep the retry loop alive here too.
+      if (conflict) this.scheduleRetry(generation)
       return
     }
     this.reservation = reservation
@@ -341,6 +355,7 @@ export class CloudflaredController implements RemoteProviderController {
           state: 'error',
           errorCode: conflict ? 'cloudflared_tunnel_port_unavailable' : 'gateway_start_failed',
         })
+        if (conflict) this.scheduleRetry(generation)
         return
       }
       if (generation !== this.generation || !this.enabled || this.disposed) {
@@ -436,6 +451,7 @@ export class CloudflaredController implements RemoteProviderController {
     if (this.gatewayValue === undefined || this.latest.state === 'ready') return
     if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
     this.startupTimer = undefined
+    this.retryAttempts = 0
     this.publish({ enabled: true, state: 'ready', ...(this.namedOrigin === undefined ? {} : { origin: this.namedOrigin }) })
   }
 
@@ -464,6 +480,7 @@ export class CloudflaredController implements RemoteProviderController {
     this.gatewayValue = gateway
     if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
     this.startupTimer = undefined
+    this.retryAttempts = 0
     this.publish({ enabled: true, state: 'ready', origin })
   }
 
@@ -502,7 +519,35 @@ export class CloudflaredController implements RemoteProviderController {
   private async failGeneration(generation: number, code: string): Promise<void> {
     if (generation !== this.generation) return
     await this.stopProcessAndGateway()
-    if (this.enabled) this.publish({ enabled: true, state: 'error', errorCode: code })
+    if (this.enabled) {
+      this.publish({ enabled: true, state: 'error', errorCode: code })
+      // A remembered-enabled tunnel must come back on its own: a dead connector
+      // used to leave the switch "on" with nothing running until the user
+      // noticed and re-toggled the channel by hand.
+      this.scheduleRetry(generation)
+    }
+  }
+
+  /**
+   * Bring the tunnel back up after a failed generation, backing off per
+   * {@link RETRY_DELAYS_MS}. The captured generation guards every path that
+   * invalidates this attempt: an explicit stop(), close(), or a newer start()
+   * bumps the generation and both the pending timer body and this scheduling
+   * call become no-ops.
+   */
+  private scheduleRetry(generation: number): void {
+    if (generation !== this.generation || !this.enabled || this.disposed) return
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer)
+    const delay = RETRY_DELAYS_MS[Math.min(this.retryAttempts, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[RETRY_DELAYS_MS.length - 1]
+    this.retryAttempts += 1
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined
+      void this.enqueue(async () => {
+        if (generation !== this.generation || !this.enabled || this.disposed) return
+        await this.start()
+      })
+    }, delay)
+    this.retryTimer.unref()
   }
 
   private async stop(): Promise<void> {
@@ -513,6 +558,8 @@ export class CloudflaredController implements RemoteProviderController {
   private async stopProcessAndGateway(): Promise<void> {
     if (this.startupTimer !== undefined) clearTimeout(this.startupTimer)
     this.startupTimer = undefined
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer)
+    this.retryTimer = undefined
     const reservation = this.reservation
     this.reservation = undefined
     const child = this.child

@@ -177,6 +177,54 @@ describe('MobileAccessGatewayController', () => {
     expect(store.state.enabled).toBe(true)
     await expect(controller.setRunning(false)).rejects.toThrow(/closing/)
   })
+
+  it('restarts an enabled gateway by itself after a failed boot', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const store = new MemoryControlStore({ version: 1, enabled: true })
+      let attempts = 0
+      const close = vi.fn()
+      const start = vi.fn(async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('EADDRNOTAVAIL: network not ready')
+        return runtime(close)
+      })
+      const controller = new MobileAccessGatewayController(store, start)
+      await controller.initialize()
+      expect(controller.isRunning()).toBe(false)
+
+      // The first retry fires after the 5 s backoff and brings the gateway up.
+      await vi.advanceTimersByTimeAsync(5_100)
+      expect(start).toHaveBeenCalledTimes(2)
+      expect(controller.isRunning()).toBe(true)
+      await controller.close()
+      expect(close).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('persists false and cancels the retry when disabling a never-started gateway', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const store = new MemoryControlStore({ version: 1, enabled: true })
+      const start = vi.fn(async () => {
+        throw new Error('EADDRNOTAVAIL: network not ready')
+      })
+      const controller = new MobileAccessGatewayController(store, start)
+      await controller.initialize()
+      expect(controller.isRunning()).toBe(false)
+
+      // The user toggles the channel off while it is still retrying the boot.
+      await controller.setRunning(false)
+      expect(store.state.enabled).toBe(false)
+      await vi.advanceTimersByTimeAsync(600_000)
+      expect(start).toHaveBeenCalledTimes(1)
+      expect(controller.isRunning()).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('FollowingMobileAccessRuntime', () => {

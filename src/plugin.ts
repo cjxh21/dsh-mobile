@@ -1258,7 +1258,14 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
     })
     try {
       await mobileAccess.startLocal(template.extensionsDir, ctx)
-      await lanController.initialize()
+      // One channel failing to bind must not tear down the others: a leftover
+      // listener on the LAN port used to abort this whole block, which disabled
+      // every remote channel too and left only the manual UI toggle as recovery.
+      try {
+        await lanController.initialize()
+      } catch (error) {
+        logger.warn('LAN gateway auto-start failed: %s', error instanceof Error ? error.message : String(error))
+      }
       const stores: Record<RemoteProvider, JsonMobileAccessControlStore> = {
         tailscale: tailscaleStore,
         cpolar: cpolarStore,
@@ -1269,7 +1276,13 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       await Promise.all((Object.keys(stores) as RemoteProvider[])
         .filter(provider => provider !== remoteProviders.selected)
         .map(provider => stores[provider].disableIfPresent()))
-      for (const provider of REMOTE_PROVIDERS) await remoteControllers[provider].initialize()
+      for (const provider of REMOTE_PROVIDERS) {
+        try {
+          await remoteControllers[provider].initialize()
+        } catch (error) {
+          logger.warn('%s remote channel auto-start failed: %s', provider, error instanceof Error ? error.message : String(error))
+        }
+      }
       // Broadcast discovery degrades silently when its UDP port cannot be bound, which
       // otherwise leaves "the phone cannot find this computer" with no visible cause.
       const lanDiscovery = lanGateway?.discoveryStatus()

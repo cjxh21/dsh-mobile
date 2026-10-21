@@ -348,6 +348,110 @@ describe('cloudflared provider lifecycle', () => {
     expect(child.exitCode).toBe(0)
     expect(controller.gateway()).toBeUndefined()
   })
+
+  it('restarts an exited connector by itself while the switch stays enabled', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const children: FakeChild[] = []
+      const spawnProcess = vi.fn(() => {
+        const next = new FakeChild()
+        children.push(next)
+        return next as unknown as ChildProcessWithoutNullStreams
+      })
+      const journal = new StatusJournal()
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-cloudflared-retry-'))
+      temporaryDirectories.push(directory)
+      const executable = join(directory, 'component', 'cloudflared.exe')
+      await mkdir(dirname(executable), { recursive: true })
+      await writeFile(executable, 'fake-cloudflared')
+      const controller = new CloudflaredController({
+        store: new MemoryControlStore(),
+        executable,
+        createGateway: async (origin, port) => gateway(origin, port),
+        tunnel: { settings: () => ({ version: 1, mode: 'quick' }) },
+        onStatus: journal.publish,
+        spawnProcess,
+      })
+      controllers.push(controller)
+      await controller.initialize()
+
+      const ready = journal.waitFor(status => status.state === 'ready')
+      children[0]!.writeBanner('https://first-tunnel.trycloudflare.com')
+      await ready
+
+      // Sleep/wake style failure: the connector dies with a nonzero exit.
+      children[0]!.exitCode = 1
+      children[0]!.emit('close', 1)
+      const failed = await journal.waitFor(status => status.state === 'error')
+      expect(failed.errorCode).toBe('cloudflared_exited')
+
+      // The first retry fires after the 5 s backoff and becomes ready again.
+      // The retry body crosses real I/O (lstat, port reservation), so advance
+      // virtual time in steps that yield to the event loop until it lands.
+      for (let at = 0; at < 100 && spawnProcess.mock.calls.length < 2; at += 1) {
+        await vi.advanceTimersByTimeAsync(100)
+      }
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      // The origin predicate keeps this wait off the first tunnel's stale ready.
+      const readyAgain = journal.waitFor(status => status.state === 'ready' && status.origin === 'https://second-tunnel.trycloudflare.com')
+      children[1]!.writeBanner('https://second-tunnel.trycloudflare.com')
+      await readyAgain
+
+      // A later failure restarts from the fast end of the schedule again.
+      children[1]!.exitCode = 1
+      children[1]!.emit('close', 1)
+      await journal.waitFor(status => status.state === 'error')
+      for (let at = 0; at < 100 && spawnProcess.mock.calls.length < 3; at += 1) {
+        await vi.advanceTimersByTimeAsync(100)
+      }
+      expect(spawnProcess).toHaveBeenCalledTimes(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('canceling the channel cancels a pending retry instead of resurrecting the tunnel', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const children: FakeChild[] = []
+      const spawnProcess = vi.fn(() => {
+        const next = new FakeChild()
+        children.push(next)
+        return next as unknown as ChildProcessWithoutNullStreams
+      })
+      const journal = new StatusJournal()
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-cloudflared-retry-'))
+      temporaryDirectories.push(directory)
+      const executable = join(directory, 'component', 'cloudflared.exe')
+      await mkdir(dirname(executable), { recursive: true })
+      await writeFile(executable, 'fake-cloudflared')
+      const controller = new CloudflaredController({
+        store: new MemoryControlStore(),
+        executable,
+        createGateway: async (origin, port) => gateway(origin, port),
+        tunnel: { settings: () => ({ version: 1, mode: 'quick' }) },
+        onStatus: journal.publish,
+        spawnProcess,
+      })
+      controllers.push(controller)
+      await controller.initialize()
+
+      const ready = journal.waitFor(status => status.state === 'ready')
+      children[0]!.writeBanner('https://only-tunnel.trycloudflare.com')
+      await ready
+
+      children[0]!.exitCode = 1
+      children[0]!.emit('close', 1)
+      await journal.waitFor(status => status.state === 'error')
+
+      const closing = controller.close()
+      await vi.advanceTimersByTimeAsync(60_000)
+      await closing
+      expect(spawnProcess).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 // Shaped like the connector token Cloudflare issues: base64url of a JSON blob.

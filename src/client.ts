@@ -1,4 +1,4 @@
-import { createElement, useEffect, useState } from 'react'
+import { createElement, useEffect, useRef, useState } from 'react'
 import {
   DIAGNOSTIC_REASON_MESSAGES,
   LOCALIZED_DIAGNOSTIC_COPY,
@@ -4203,7 +4203,13 @@ export function apply(ctx: ClientContext): void {
       const control = installControl()
       const triggerLocale = selectedMobileControlLocale()
       const t = controlTranslator(triggerLocale)
-      const disposeSlot = ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register<{ wide: boolean }>({ name: 'sidebar.footer.action', id: 'dsh-mobile' }, ({ wide }) => createElement('button', {
+      /* ── 移动访问入口：侧栏 footer → 「设置 → 通用」（2026-10-05）──
+         侧栏不再出现「移动访问」；改为设置页的一行（左说明、右按钮），
+         用的是同一个 control.toggle，行为完全一致。
+         ⚠ 兜底：MOBILE_ACCESS_IN_SETTINGS 改回 false 即恢复侧栏入口
+         （两者二选一，不会同时出现）。 */
+      const MOBILE_ACCESS_IN_SETTINGS = true
+      const triggerButton = (wide: boolean) => createElement('button', {
         'aria-expanded': control.isOpen(),
         'aria-controls': CONTROL_PANEL_ID,
         'aria-label': t('mobileAccess'),
@@ -4224,8 +4230,71 @@ export function apply(ctx: ClientContext): void {
         strokeWidth: 1.5,
         strokeLinecap: 'round',
         strokeLinejoin: 'round',
-      }, createElement('rect', { x: 4, y: 1, width: 8, height: 14, rx: 2 }), createElement('path', { d: 'M7 12h2' })), wide ? createElement('span', { className: 'dsh-mobile-control__trigger-label' }, t('mobileAccess')) : undefined)))
-      return () => { disposeSlot(); control.remove() }
+      }, createElement('rect', { x: 4, y: 1, width: 8, height: 14, rx: 2 }), createElement('path', { d: 'M7 12h2' })), wide ? createElement('span', { className: 'dsh-mobile-control__trigger-label' }, t('mobileAccess')) : undefined)
+      /* 设置页里内嵌显示的控制面板：把 installControl 造好的 panel 节点
+         整体搬进设置分区（不是再放一个按钮 → 不会「移动访问里嵌移动访问」），
+         离开设置时搬回原处并恢复 hidden。
+         面板本体带 .dsh-mobile-control__panel 卡片样式，但外层 root 是
+         position:fixed;left:16px;bottom:112px（浮动窗），内嵌时必须中和掉。 */
+      const EMBEDDED_STYLE_ID = 'dsh-mobile-embedded-panel-style'
+      const installEmbeddedStyle = (): void => {
+        if (document.getElementById(EMBEDDED_STYLE_ID) !== null) return
+        const style = element('style')
+        style.id = EMBEDDED_STYLE_ID
+        style.textContent = [
+          '[data-dsh-mobile-embedded].dsh-mobile-control__panel{position:static !important;left:auto !important;bottom:auto !important;z-index:auto !important;box-sizing:border-box !important;width:100% !important;max-width:none !important;max-height:none !important;box-shadow:none !important;border-radius:12px !important;}',
+          '[data-dsh-mobile-embedded] .dsh-mobile-control__close{display:none !important;}',
+        ].join('\n')
+        document.head.append(style)
+      }
+      const MobileAccessEmbeddedPanel = () => {
+        const hostRef = useRef<HTMLDivElement | null>(null)
+        useEffect(() => {
+          installEmbeddedStyle()
+          let restore: (() => void) | undefined
+          const attach = (): boolean => {
+            const host = hostRef.current
+            const panel = document.getElementById(CONTROL_PANEL_ID)
+            if (host === null || panel === null) return false
+            const parent = panel.parentNode
+            const next = panel.nextSibling
+            const wasHidden = panel.hidden
+            panel.hidden = false
+            panel.setAttribute('data-dsh-mobile-embedded', '')
+            host.append(panel)
+            restore = () => {
+              panel.removeAttribute('data-dsh-mobile-embedded')
+              panel.hidden = wasHidden
+              if (parent !== null) parent.insertBefore(panel, next)
+            }
+            return true
+          }
+          /* 面板由 installControl 在插件挂载时创建，设置页可能先渲染 → 短暂重试 */
+          let tries = 0
+          const timer = window.setInterval(() => {
+            tries += 1
+            if (attach() || tries > 40) window.clearInterval(timer)
+          }, 50)
+          if (attach()) window.clearInterval(timer)
+          return () => {
+            window.clearInterval(timer)
+            restore?.()
+          }
+        }, [])
+        return createElement('div', { ref: hostRef })
+      }
+      const disposeSettings = MOBILE_ACCESS_IN_SETTINGS
+        ? ctx.slots.inject('settings.section', () => ctx.slots.register({
+            name: 'settings.section',
+            id: 'dsh-mobile-access',
+            order: 90,
+            label: t('mobileAccess'),
+          }, MobileAccessEmbeddedPanel))
+        : undefined
+      const disposeSlot = MOBILE_ACCESS_IN_SETTINGS
+        ? undefined
+        : ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register<{ wide: boolean }>({ name: 'sidebar.footer.action', id: 'dsh-mobile' }, ({ wide }) => triggerButton(wide)))
+      return () => { disposeSettings?.(); disposeSlot?.(); control.remove() }
     })
     return () => { removeControl(); removeVoiceSession(); style.remove() }
   }, 'dsh-mobile: stock mobile adaptation and local control')
