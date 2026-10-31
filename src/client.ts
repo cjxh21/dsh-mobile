@@ -1,4 +1,4 @@
-import { createElement, useEffect, useState, useSyncExternalStore } from 'react'
+import { createElement, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import {
   DIAGNOSTIC_REASON_MESSAGES,
   LOCALIZED_DIAGNOSTIC_COPY,
@@ -273,6 +273,22 @@ export function mobileBackBlockedMessage(locale: MobileControlLocale): string {
   return messages[locale]
 }
 
+let mobileAccessInSettingsFlag = true
+
+/**
+ * Local customization: whether the Mobile Access entry sits in Settings instead
+ * of the sidebar footer. Defaults to true; the footer stays available as a
+ * fallback so 0.8.0 stock placement can be restored with one switch.
+ */
+export function mobileAccessInSettings(): boolean {
+  return mobileAccessInSettingsFlag
+}
+
+/** Test-only seam (and fallback switch): pick between the two entry placements. */
+export function setMobileAccessInSettings(value: boolean): void {
+  mobileAccessInSettingsFlag = value
+}
+
 /** Remount one plugin-owned surface when DSH changes the document language. */
 export function installDshLanguageBoundSurface(install: () => () => void): () => void {
   let locale = selectedMobileControlLocale()
@@ -512,7 +528,75 @@ function MobileTaskNotificationRow(): unknown {
 const CONTROL_REQUEST_TIMEOUT_MS = 15_000
 const LONG_CONTROL_REQUEST_TIMEOUT_MS = 210_000
 const GITHUB_RELEASES_URL = 'https://github.com/saya-ch/dsh-mobile/releases'
-const CONTROL_PANEL_ID = 'dsh-mobile-control-panel'
+/** Id of the single panel installControl() owns; Settings re-hosts this node. */
+export const CONTROL_PANEL_ID = 'dsh-mobile-control-panel'
+const EMBEDDED_PANEL_STYLE_ID = 'dsh-mobile-embedded-panel-style'
+// The control lives in a position:fixed floating shell (see CONTROL_STYLES).
+// Hosting the panel inside a Settings section therefore needs these rules to
+// neutralize the floating geometry while data-dsh-mobile-embedded is present;
+// the close button is redundant once the section itself is the container.
+const EMBEDDED_PANEL_STYLES = [
+  '[data-dsh-mobile-embedded].dsh-mobile-control__panel{position:static !important;inset:auto !important;z-index:auto !important;box-sizing:border-box !important;width:100% !important;max-width:none !important;max-height:none !important;box-shadow:none !important;border-radius:12px !important;}',
+  '[data-dsh-mobile-embedded] .dsh-mobile-control__close{display:none !important;}',
+].join('\n')
+
+/**
+ * Whether the panel currently lives inside a Settings section.
+ * Such a panel has no floating trigger to reopen it, so dismissing it would
+ * remove it for good; dismissal and Escape therefore leave it alone.
+ */
+export function isEmbeddedControlPanel(panel: { hasAttribute(name: string): boolean }): boolean {
+  return panel.hasAttribute('data-dsh-mobile-embedded')
+}
+
+/** One panel relocation: attach() moves the panel into the host at most once. */
+export interface EmbeddedControlPanel {
+  /** Move the control panel into the host; false while the panel does not exist yet. */
+  attach(): boolean
+  /** Put the panel back where it was and drop the embedded styling. */
+  dispose(): void
+}
+
+/**
+ * Relocate the control panel into a Settings section instead of showing the
+ * floating shell, then restore the original parent, sibling and hidden state on
+ * disposal. Ownership of the panel node itself stays with installControl().
+ */
+export function embedControlPanel(host: HTMLElement, page: Document = document): EmbeddedControlPanel {
+  let restore: (() => void) | undefined
+  const removeStyle = (): void => { page.getElementById(EMBEDDED_PANEL_STYLE_ID)?.remove() }
+  return {
+    attach() {
+      if (restore !== undefined) return true
+      const panel = page.getElementById(CONTROL_PANEL_ID)
+      if (panel === null) return false
+      const style = page.getElementById(EMBEDDED_PANEL_STYLE_ID) ?? page.createElement('style')
+      style.id = EMBEDDED_PANEL_STYLE_ID
+      style.textContent = EMBEDDED_PANEL_STYLES
+      if (style.parentNode === null) page.head.append(style)
+      const parent = panel.parentNode
+      const next = panel.nextSibling
+      const wasHidden = panel.hidden
+      panel.hidden = false
+      panel.setAttribute('data-dsh-mobile-embedded', '')
+      host.append(panel)
+      restore = () => {
+        restore = undefined
+        panel.removeAttribute('data-dsh-mobile-embedded')
+        panel.hidden = wasHidden
+        if (parent !== null) parent.insertBefore(panel, next)
+        // Dropping the rule after the attribute keeps the restored panel from
+        // inheriting half of the embedded geometry while it moves back.
+        removeStyle()
+      }
+      return true
+    },
+    dispose() {
+      if (restore === undefined) { removeStyle(); return }
+      restore()
+    },
+  }
+}
 
 export interface ClientReleaseInfo {
   readonly updateAvailable: boolean
@@ -942,7 +1026,7 @@ export function localizedDiagnosticEntryCopy(
   return { detail, action }
 }
 
-function installControl(): { remove: () => void; toggle: () => void; isOpen: () => boolean } {
+function installControl(): { remove: () => void; toggle: () => void; isOpen: () => boolean; activate: () => void } {
 
   /** The table above, translated, for the status repaint. */
   const translatedRemoteErrors = (): Record<string, string> =>
@@ -1933,7 +2017,10 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   }
   panel.addEventListener('keydown', event => {
     if (event.defaultPrevented) return
-    if (event.key === 'Escape') { event.preventDefault(); setOpen(false); return }
+    if (event.key === 'Escape') {
+      if (isEmbeddedControlPanel(panel)) return
+      event.preventDefault(); setOpen(false); return
+    }
     if (event.key !== 'Tab') return
     const controls = [...panel.querySelectorAll<HTMLElement>('button,a[href],input,select,textarea,[tabindex]')]
       .filter(node => node.tabIndex >= 0 && !node.matches(':disabled') && node.getClientRects().length > 0)
@@ -4029,7 +4116,7 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
   linkPair.addEventListener('click', () => { openPairing('link') })
   close.addEventListener('click', () => { setOpen(false) })
   const dismiss = (event: PointerEvent): void => {
-    if (panel.hidden || !(event.target instanceof Node)) return
+    if (panel.hidden || isEmbeddedControlPanel(panel) || !(event.target instanceof Node)) return
     if (!panel.contains(event.target) && !irohQrZoom.contains(event.target) && !document.querySelector('.dsh-mobile-control__trigger')?.contains(event.target)) setOpen(false)
   }
   document.addEventListener('pointerdown', dismiss)
@@ -4049,7 +4136,16 @@ function installControl(): { remove: () => void; toggle: () => void; isOpen: () 
     }, () => { /* gateway unreachable; dot keeps its last state */ })
   }
   const wsBlockedPoll = window.setInterval(() => { pollWsBlocked(); if (!panel.hidden) void extensionRecovery.refresh() }, 20_000)
-  return { remove: () => { lifecycle.abort(); extensionRecovery.dispose(); window.clearInterval(remotePoll); window.clearInterval(wsBlockedPoll); window.removeEventListener('focus', retryAfterSetup); document.removeEventListener('visibilitychange', retryAfterSetup); document.removeEventListener('pointerdown', dismiss); root.remove() }, toggle: () => { setOpen(panel.hidden !== false) }, isOpen: () => !panel.hidden }
+  // The floating panel runs these lazy loads from setOpen(true). A Settings
+  // section shows the panel without ever opening it, so the same loads have to
+  // be reachable on their own or the first paint waits for the 20s background
+  // poll. Deliberately excludes the dialog role, close-button focus and the
+  // trigger aria sync: an embedded panel is a section, not a modal.
+  const activate = (): void => {
+    void extensionRecovery.refresh()
+    void controlRequestJson('/api/mobile-access/release').then(renderRelease, () => {})
+  }
+  return { remove: () => { lifecycle.abort(); extensionRecovery.dispose(); window.clearInterval(remotePoll); window.clearInterval(wsBlockedPoll); window.removeEventListener('focus', retryAfterSetup); document.removeEventListener('visibilitychange', retryAfterSetup); document.removeEventListener('pointerdown', dismiss); root.remove() }, toggle: () => { setOpen(panel.hidden !== false) }, isOpen: () => !panel.hidden, activate }
 }
 
 function mobileRequest(path: string, init: RequestInit = {}): Promise<Response> {
@@ -5457,7 +5553,11 @@ export function apply(ctx: ClientContext): void {
       const control = installControl()
       const triggerLocale = selectedMobileControlLocale()
       const t = controlTranslator(triggerLocale)
-      const disposeSlot = ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register<{ wide: boolean }>({ name: 'sidebar.footer.action', id: 'dsh-mobile' }, ({ wide }) => createElement('button', {
+      // Local customization: the Mobile Access entry lives in Settings, so the
+      // sidebar footer no longer shows it. Both placements share the same
+      // control.toggle; exactly one of them is registered per mount.
+      const inSettings = mobileAccessInSettings()
+      const triggerButton = (wide: boolean) => createElement('button', {
         'aria-expanded': control.isOpen(),
         'aria-controls': CONTROL_PANEL_ID,
         'aria-label': t('mobileAccess'),
@@ -5478,8 +5578,52 @@ export function apply(ctx: ClientContext): void {
         strokeWidth: 1.5,
         strokeLinecap: 'round',
         strokeLinejoin: 'round',
-      }, createElement('rect', { x: 4, y: 1, width: 8, height: 14, rx: 2 }), createElement('path', { d: 'M7 12h2' })), wide ? createElement('span', { className: 'dsh-mobile-control__trigger-label' }, t('mobileAccess')) : undefined)))
-      return () => { disposeSlot(); control.remove() }
+      }, createElement('rect', { x: 4, y: 1, width: 8, height: 14, rx: 2 }), createElement('path', { d: 'M7 12h2' })), wide ? createElement('span', { className: 'dsh-mobile-control__trigger-label' }, t('mobileAccess')) : undefined)
+      // Settings shows the panel installControl already built: move that node
+      // into the section instead of nesting another trigger inside it, and put
+      // it back with its previous hidden state when the section unmounts.
+      const MobileAccessEmbeddedPanel = () => {
+        const hostRef = useRef<HTMLDivElement | null>(null)
+        useEffect(() => {
+          const host = hostRef.current
+          if (host === null) return
+          const embedded = embedControlPanel(host, document)
+          // installControl creates the panel when the plugin mounts, and the
+          // Settings section may render first, so retry briefly instead of
+          // assuming the node already exists.
+          let attempts = 0
+          const attach = (): boolean => {
+            if (!embedded.attach()) return false
+            // The panel only runs its lazy release/recovery loads when the
+            // floating shell opens, and a Settings section never opens it, so
+            // trigger the same loads once the node is really on screen.
+            control.activate()
+            return true
+          }
+          const retry = window.setInterval(() => {
+            attempts += 1
+            if (attach() || attempts > 40) window.clearInterval(retry)
+          }, 50)
+          if (attach()) window.clearInterval(retry)
+          return () => {
+            window.clearInterval(retry)
+            embedded.dispose()
+          }
+        }, [])
+        return createElement('div', { ref: hostRef })
+      }
+      const disposeSettings = inSettings
+        ? ctx.slots.inject('settings.section', () => ctx.slots.register({
+            name: 'settings.section',
+            id: 'dsh-mobile-access',
+            order: 90,
+            label: t('mobileAccess'),
+          }, MobileAccessEmbeddedPanel))
+        : undefined
+      const disposeSlot = inSettings
+        ? undefined
+        : ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register<{ wide: boolean }>({ name: 'sidebar.footer.action', id: 'dsh-mobile' }, ({ wide }) => triggerButton(wide)))
+      return () => { disposeSettings?.(); disposeSlot?.(); control.remove() }
     })
     return () => { disposeClientModuleDialogs(); removeModuleSettings(); removeControl(); removeCustom(); removeVoiceSession(); removeDraftTransfer(); style.remove() }
   }, 'dsh-mobile: stock mobile adaptation and local control')

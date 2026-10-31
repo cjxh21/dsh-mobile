@@ -16,7 +16,11 @@ const modePath = `${prefix}/remote/origin/mode`
 const caddyPath = `${prefix}/remote/caddy/settings`
 const hostsPath = `${prefix}/extensions/hosts`
 const recoverPath = `${prefix}/extensions/recover`
-const fixtureHtml = '<!doctype html><html lang="en"><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><section id="fixture-settings"></section><footer id="fixture-sidebar"></footer></body></html>'
+// Mobile Access now renders inside a Settings section, and the fixture has no
+// settings shell to give that section its content column width. Pin the host to
+// the panel's own design width so the responsive form assertions still measure a
+// settings-width card instead of the whole 1100px browser window.
+const fixtureHtml = '<!doctype html><html lang="en"><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body><section id="fixture-settings" style="max-width:704px"></section><footer id="fixture-sidebar"></footer></body></html>'
 
 function remoteState() {
   return {
@@ -236,13 +240,34 @@ async function withControl(browser, name, options, run) {
         const svg = ['svg', 'rect', 'path'].includes(type)
         const node = svg ? document.createElementNS('http://www.w3.org/2000/svg', type) : document.createElement(type)
         for (const [key, value] of Object.entries(props ?? {})) {
+          // Settings re-hosts the existing panel through ref.current, so the shim
+          // links the ref instead of writing a "ref" attribute.
+          if (key === 'ref') {
+            if (typeof value === 'function') value(node)
+            else if (value !== null && typeof value === 'object') value.current = node
+            continue
+          }
           if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value)
           else if (value !== undefined && value !== null) node.setAttribute(key === 'className' ? 'class' : key, String(value))
         }
         for (const child of children.flat(Infinity)) if (child !== undefined && child !== null) node.append(child)
         return node
       }
-      const react = { createElement, useEffect: () => { throw new Error('Unexpected React hook in sidebar fixture') }, useState: () => { throw new Error('Unexpected React hook in sidebar fixture') } }
+      // A component renders before its node reaches the document, and the embedded
+      // Mobile Access section can only find its host afterwards, so effects queue
+      // during render and the slot host flushes them once the node is in place.
+      let queued = []
+      const react = {
+        createElement,
+        useRef: initial => ({ current: initial ?? null }),
+        useEffect: effect => { queued.push(effect) },
+        useState: () => { throw new Error('Unexpected React hook in the control fixture: useState') },
+        useSyncExternalStore: () => { throw new Error('Unexpected React hook in the control fixture: useSyncExternalStore') },
+      }
+      const runEffects = owners => {
+        const effects = queued; queued = []
+        for (const effect of effects) { const dispose = effect(); if (typeof dispose === 'function') owners.push(dispose) }
+      }
       const cleanup = []
       window.fixtureConsumed = []
       const originalFetch = window.fetch.bind(window)
@@ -269,18 +294,28 @@ async function withControl(browser, name, options, run) {
           inject: (_name, install) => install(),
           register: (metadata, render) => {
             let node
+            const owners = []
             if (metadata.name === 'settings.general.item' && metadata.id === 'dsh-mobile-client-modules') {
               node = render({}); document.querySelector('#fixture-settings').append(node)
+            } else if (metadata.name === 'settings.section' && metadata.id === 'dsh-mobile-access') {
+              // Settings hosts the real control panel; render, then run the
+              // deferred effects now that the host div is inside the document.
+              node = render({}); document.querySelector('#fixture-settings').append(node)
+              runEffects(owners)
             } else if (metadata.name === 'sidebar.footer.action' && metadata.id === 'dsh-mobile') {
               node = render({ wide: true }); document.querySelector('#fixture-sidebar').append(node)
             } else throw new Error(`Unexpected control fixture slot: ${metadata.name} ${metadata.id}`)
-            return () => { node.remove() }
+            return () => { for (const dispose of owners.splice(0).reverse()) dispose(); node.remove() }
           },
         },
       }) }
       window.disposeClient = () => { while (cleanup.length > 0) cleanup.pop()(); window.fetch = originalFetch }
     })
     await page.addScriptTag({ content: client })
+    // Mobile Access lives in Settings by default; the footer placement stays
+    // available through the plugin's own fallback switch, and only cases that
+    // need a floating trigger (close/reopen, dismiss, trigger focus) use it.
+    if (options.footerPlacement === true) await page.evaluate(() => { window.mobileClient.setMobileAccessInSettings(false) })
     await page.evaluate(() => { window.mountClient() })
     const consumed = pathname => page.evaluate(path => window.fixtureConsumed.filter(value => value === path).length, pathname)
     const settle = async (pathname, previous) => {
@@ -301,7 +336,22 @@ async function withControl(browser, name, options, run) {
       assert.equal(await page.locator('#fixture-settings .dsh-module-title').textContent(), 'Mobile page modules', `${name}: missing General settings registration`)
       assert.equal(await page.locator('#fixture-settings .dsh-module-description').textContent(), 'Mobile defaults for this computer. Desktop plugins are unchanged.', `${name}: General settings did not use computer scope`)
     }
-    await page.locator('.dsh-mobile-control__trigger').click()
+    // Settings hosts the panel openly (there is no floating trigger to click);
+    // the footer fallback still opens by trigger, so accept whichever is mounted.
+    const trigger = page.locator('.dsh-mobile-control__trigger')
+    if (options.footerPlacement === true) {
+      await trigger.waitFor({ state: 'visible' })
+      await trigger.click()
+      await page.locator('.dsh-mobile-control__panel').waitFor({ state: 'visible' })
+    } else {
+      // Assert the default placement itself, so a silent fall back to the footer
+      // cannot make the Settings coverage disappear while the cases still pass.
+      const panel = page.locator('#fixture-settings #dsh-mobile-control-panel[data-dsh-mobile-embedded]')
+      await panel.waitFor({ state: 'visible' })
+      assert.equal(await trigger.count(), 0, `${name}: Settings placement also registered a footer trigger`)
+      assert.equal(await page.locator('.dsh-mobile-control').evaluate(node => node.parentElement === document.body), true,
+        `${name}: embedded panel did not keep its owning shell`)
+    }
     const ui = {
       trustedSummary: page.locator('summary').filter({ hasText: /^Additional trusted networks/ }),
       trustedInput: page.getByLabel('Additional source networks', { exact: true }),
@@ -473,7 +523,9 @@ try {
   })
   cases++
   for (const touch of [false, true]) {
-    await withControl(browser, `cloudflared notes and modal keyboard ${touch ? 'touch' : 'pointer'}`, { touch, width: touch ? 390 : 1100 }, async ({ page, state, consumed, settle, openRemote }) => {
+    // Escape-close and trigger-focus restore only exist for the floating panel, so
+    // this case keeps the plugin's footer fallback instead of the Settings host.
+    await withControl(browser, `cloudflared notes and modal keyboard ${touch ? 'touch' : 'pointer'}`, { touch, width: touch ? 390 : 1100, footerPlacement: true }, async ({ page, state, consumed, settle, openRemote }) => {
       await openRemote()
       state.remote.providers.cloudflared = { component: { installed: true, supported: true }, configuration: { mode: 'quick', configured: false } }
       const before = await consumed(`${prefix}/remote/provider`)
@@ -686,7 +738,9 @@ try {
     cases++
   }
 
-  await withControl(browser, 'managed readiness uses server truth, not the HTTPS form preview', { managedReady: true }, async ({ page, state, ui, count, openRemote, pollRemote }) => {
+  // Close/reopen is a floating-panel lifetime; Settings keeps the panel mounted,
+  // so the retained-preview cases run the footer fallback placement.
+  await withControl(browser, 'managed readiness uses server truth, not the HTTPS form preview', { managedReady: true, footerPlacement: true }, async ({ page, state, ui, count, openRemote, pollRemote }) => {
     const badge = page.locator('.dsh-mobile-control__provider.is-origin .dsh-mobile-control__provider-badge')
     const notice = page.locator('.dsh-mobile-control__remote-workspace .dsh-mobile-control__status[aria-live="polite"]')
     const assertManaged = async () => {
@@ -737,7 +791,7 @@ try {
   })
   cases++
 
-  await withControl(browser, 'retained external preview cannot mislabel a server-managed connection', { managedReady: true }, async ({ page, state, ui, count, openRemote, pollRemote }) => {
+  await withControl(browser, 'retained external preview cannot mislabel a server-managed connection', { managedReady: true, footerPlacement: true }, async ({ page, state, ui, count, openRemote, pollRemote }) => {
     await openRemote()
     // First follow an external server mode, then explicitly stage and return to
     // its external form. This exercises the existing retained-preview policy.
@@ -1052,7 +1106,9 @@ try {
 
   const stoppedHost = { id: 'stopped-worker', name: '<b>Stopped worker</b>', mode: 'worker', state: 'unavailable', generation: 'a'.repeat(64) }
   for (const language of ['en', 'zh', 'it']) {
-    await withControl(browser, `explicit worker recovery ${language}`, { layoutFixture: true, language, width: 360,
+    // Recovery refresh is tied to opening the floating control, so these cases
+    // use the footer placement instead of the Settings host.
+    await withControl(browser, `explicit worker recovery ${language}`, { layoutFixture: true, language, width: 360, footerPlacement: true,
       hosts: [stoppedHost, { ...stoppedHost, id: 'ready-worker', state: 'ready' }, { ...stoppedHost, id: 'inline', mode: 'in-process' }],
     }, async ({ page, count, consumed, settle, openRemote }) => {
       const section = page.locator('.dsh-mobile-control__extension-recovery')
@@ -1095,7 +1151,7 @@ try {
     cases++
   }
 
-  await withControl(browser, 'cancelled worker recovery never sends a write', { hosts: [stoppedHost], cancelDialogs: true }, async ({ page, count }) => {
+  await withControl(browser, 'cancelled worker recovery never sends a write', { hosts: [stoppedHost], cancelDialogs: true, footerPlacement: true }, async ({ page, count }) => {
     await page.locator('.dsh-mobile-control__extension-recovery').waitFor({ state: 'visible' })
     await page.locator('button[data-extension-recovery-id]').click()
     assert.equal(count('POST', recoverPath), 0)
@@ -1103,7 +1159,10 @@ try {
   })
   cases++
 
-  await withControl(browser, 'worker recovery serializes writes and ignores an older read', { hosts: [stoppedHost, { ...stoppedHost, id: 'second-worker' }], holdRecovery: true }, async ({ page, state, count, waitRequest, consumed, settle, openRemote }) => {
+  // Recovery only refreshes when the control opens or changes view, and the
+  // Settings host never opens, so the refresh-driven recovery cases stay on the
+  // floating placement where opening the panel is the trigger under test.
+  await withControl(browser, 'worker recovery serializes writes and ignores an older read', { hosts: [stoppedHost, { ...stoppedHost, id: 'second-worker' }], holdRecovery: true, footerPlacement: true }, async ({ page, state, count, waitRequest, consumed, settle, openRemote }) => {
     const section = page.locator('.dsh-mobile-control__extension-recovery')
     await section.waitFor({ state: 'visible' })
     state.holdHosts = true
@@ -1128,7 +1187,7 @@ try {
   })
   cases++
 
-  await withControl(browser, 'worker restart failure stays actionable through background refresh', { hosts: [stoppedHost], recoveryError: 'extension_changed_during_activation' }, async ({ page, state, consumed, settle }) => {
+  await withControl(browser, 'worker restart failure stays actionable through background refresh', { hosts: [stoppedHost], recoveryError: 'extension_changed_during_activation', footerPlacement: true }, async ({ page, state, consumed, settle }) => {
     const section = page.locator('.dsh-mobile-control__extension-recovery')
     await section.waitFor({ state: 'visible' })
     const previous = await consumed(recoverPath)
@@ -1149,7 +1208,9 @@ try {
   })
   cases++
 
-  await withControl(browser, 'late recovery read cannot update a disposed control', { hosts: [stoppedHost] }, async ({ page }) => {
+  // Opening the floating panel is what re-requests the Host list here, so this
+  // case keeps the footer fallback to provoke the late read it disposes.
+  await withControl(browser, 'late recovery read cannot update a disposed control', { hosts: [stoppedHost], footerPlacement: true }, async ({ page }) => {
     const section = page.locator('.dsh-mobile-control__extension-recovery')
     await section.waitFor({ state: 'visible' })
     await page.evaluate(payload => {

@@ -230,6 +230,111 @@ describe('MobileAccessGatewayController', () => {
     expect(store.state.enabled).toBe(true)
     await expect(controller.setRunning(false)).rejects.toThrow(/closing/)
   })
+
+  it('restarts an enabled gateway by itself after a failed boot', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const store = new MemoryControlStore({ version: 1, enabled: true })
+      let attempts = 0
+      const close = vi.fn()
+      const start = vi.fn(async () => {
+        attempts += 1
+        if (attempts === 1) throw new Error('EADDRINUSE: port held by the previous DSH process')
+        return runtime(close)
+      })
+      const controller = new MobileAccessGatewayController(store, start)
+      // A failed boot must not reject: the control routes have to stay usable.
+      await controller.initialize()
+      expect(controller.isRunning()).toBe(false)
+
+      // The first retry fires after the 5 s backoff and brings the gateway up.
+      await vi.advanceTimersByTimeAsync(5_100)
+      expect(start).toHaveBeenCalledTimes(2)
+      expect(controller.isRunning()).toBe(true)
+      await controller.close()
+      expect(close).toHaveBeenCalledOnce()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('backs off across failed retries and resets the schedule after a success', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const store = new MemoryControlStore({ version: 1, enabled: true })
+      let attempts = 0
+      const start = vi.fn(async () => {
+        attempts += 1
+        // Fail the boot and its first two retries: 5 s, then 15 s.
+        if (attempts <= 3) throw new Error('EADDRNOTAVAIL: network not ready')
+        return runtime()
+      })
+      const controller = new MobileAccessGatewayController(store, start)
+      await controller.initialize()
+      expect(start).toHaveBeenCalledOnce()
+
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(start).toHaveBeenCalledTimes(2)
+      // The next wait is the second delay, not another 5 s.
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(start).toHaveBeenCalledTimes(2)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(start).toHaveBeenCalledTimes(3)
+      expect(controller.isRunning()).toBe(false)
+
+      // The 60 s step brings it up, which clears the schedule.
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(start).toHaveBeenCalledTimes(4)
+      expect(controller.isRunning()).toBe(true)
+      await controller.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('persists false and cancels the retry when disabling a never-started gateway', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const store = new MemoryControlStore({ version: 1, enabled: true })
+      const start = vi.fn(async () => {
+        throw new Error('EADDRNOTAVAIL: network not ready')
+      })
+      const controller = new MobileAccessGatewayController(store, start)
+      await controller.initialize()
+      expect(controller.isRunning()).toBe(false)
+
+      // The user toggles the channel off while it is still retrying the boot.
+      await controller.setRunning(false)
+      expect(store.state.enabled).toBe(false)
+      expect(store.saved).toEqual([{ version: 1, enabled: false }])
+      await vi.advanceTimersByTimeAsync(600_000)
+      expect(start).toHaveBeenCalledTimes(1)
+      expect(controller.isRunning()).toBe(false)
+      await controller.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops retrying when the owner closes during the backoff', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const store = new MemoryControlStore({ version: 1, enabled: true })
+      const start = vi.fn(async () => {
+        throw new Error('EADDRINUSE: port held by the previous DSH process')
+      })
+      const controller = new MobileAccessGatewayController(store, start)
+      await controller.initialize()
+      expect(start).toHaveBeenCalledOnce()
+
+      await controller.close()
+      await vi.advanceTimersByTimeAsync(600_000)
+      expect(start).toHaveBeenCalledOnce()
+      expect(controller.isRunning()).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
 
 describe('FollowingMobileAccessRuntime', () => {

@@ -915,7 +915,20 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
   if (loaded.kind === 'unconfigured' && (await lanControlStore.load()).enabled) {
     await lanControlStore.save({ version: 1, enabled: false })
   }
-  const lanController = new MobileAccessGatewayController(lanControlStore, startRuntime)
+  // The controller swallows an enabled-but-failed gateway start into its own
+  // retry schedule, so the concrete cause would otherwise never reach the log
+  // and a phone that cannot reconnect would have no visible reason on the host.
+  // Log every attempt here, where the plugin owns the logger, and rethrow so the
+  // controller still decides the retry behavior.
+  const loggedStartRuntime = async (): Promise<MobileAccessRuntime> => {
+    try {
+      return await startRuntime()
+    } catch (error) {
+      logger.warn('LAN gateway start failed: %s', error instanceof Error ? error.message : String(error))
+      throw error
+    }
+  }
+  const lanController = new MobileAccessGatewayController(lanControlStore, loggedStartRuntime)
   const remoteDeviceFile = join(remoteDirectory, 'devices.json')
   const legacyCpolarDeviceFile = join(remoteDirectory, 'cpolar', 'devices.json')
   if (initialRemoteProvider === 'cpolar') {
@@ -1908,7 +1921,16 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
         if (generation !== undefined) await generation.ready
       }
       await mobileAccess.startLocal(template.extensionsDir, ctx, { hostExecution: template.hostExecution })
-      await lanController.initialize()
+      // One channel failing must not tear down the others. The controller itself
+      // already turns a failed gateway start into its own retry schedule, so what
+      // reaches here is a non-start failure (unreadable control file, controller
+      // state misuse); it used to abort this whole block and disable every remote
+      // channel with it, leaving only the manual UI toggle as recovery.
+      try {
+        await lanController.initialize()
+      } catch (error) {
+        logger.warn('LAN gateway auto-start failed: %s', error instanceof Error ? error.message : String(error))
+      }
       const stores: Record<RemoteProvider, JsonMobileAccessControlStore> = {
         tailscale: tailscaleStore,
         cpolar: cpolarStore,
@@ -1919,8 +1941,14 @@ export async function apply(ctx: Context, config: PluginConfig): Promise<void> {
       }
       const prepared = await prepareDisabledRemoteProviders(remoteProviders.selected, stores)
       for (const provider of REMOTE_PROVIDERS) {
-        if (provider === remoteProviders.selected) await remoteControllers[provider].initialize()
-        else await remoteControllers[provider].initialize(prepared.get(provider))
+        // Each provider owns an independent switch and process; one that cannot
+        // start must leave the remaining channels on their own startup path.
+        try {
+          if (provider === remoteProviders.selected) await remoteControllers[provider].initialize()
+          else await remoteControllers[provider].initialize(prepared.get(provider))
+        } catch (error) {
+          logger.warn('%s remote channel auto-start failed: %s', provider, error instanceof Error ? error.message : String(error))
+        }
       }
       // Broadcast discovery degrades silently when its UDP port cannot be bound, which
       // otherwise leaves "the phone cannot find this computer" with no visible cause.

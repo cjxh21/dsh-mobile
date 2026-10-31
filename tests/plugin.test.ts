@@ -13,7 +13,12 @@ import { dirname, join } from 'node:path'
 import { generate } from 'selfsigned'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Config, parseGatewayConfig, type PluginConfig } from '../src/config.js'
-import { JsonMobileAccessControlStore } from '../src/control.js'
+import { JsonMobileAccessControlStore, MobileAccessGatewayController, type MobileAccessControlState } from '../src/control.js'
+import type { RemoteProviderController } from '../src/remote.js'
+import { CloudflaredController } from '../src/cloudflared.js'
+import { CpolarController } from '../src/cpolar.js'
+import { IrohController } from '../src/iroh.js'
+import { ManagedOriginController } from '../src/managed-origin.js'
 import { parseCidr, RequestTrustPolicy } from '../src/network.js'
 import * as network from '../src/network.js'
 import { apply, frpIngressGatewayConfig, inject, originGatewayConfig, remoteGatewayConfig, settleCleanupSteps, upstreamAuthenticatedUrl } from '../src/plugin.js'
@@ -496,6 +501,30 @@ async function managedSetupFile(upstreamOrigin: string): Promise<string> {
   return setupFile
 }
 
+/**
+ * Record the auto-start of every remote channel and let one provider's start fail.
+ * Prototype spies keep the real plugin wiring, so ordering is what it observes.
+ */
+function recordRemoteChannelStarts(failing?: string): string[] {
+  const started: string[] = []
+  const controllers: readonly [string, { prototype: RemoteProviderController }][] = [
+    ['tailscale', FunnelController], ['cpolar', CpolarController], ['cloudflared', CloudflaredController],
+    ['frp', FrpController], ['origin', ManagedOriginController], ['iroh', IrohController],
+  ]
+  for (const [provider, controller] of controllers) {
+    const original = controller.prototype.initialize
+    vi.spyOn(controller.prototype, 'initialize').mockImplementation(async function (
+      this: RemoteProviderController,
+      initialState?: MobileAccessControlState,
+    ) {
+      started.push(provider)
+      if (provider === failing) throw new Error(`${provider}_test_start_failure`)
+      await original.call(this, initialState)
+    })
+  }
+  return started
+}
+
 describe('upstream browser authentication', () => {
   const upstreamOrigin = new URL('http://127.0.0.1:3080')
   const withConnection = (connection: unknown): Context => ({ connection } as unknown as Context)
@@ -717,6 +746,56 @@ describe('stock DSH lifecycle', () => {
     await mount(false)
     expect(disable).toHaveBeenCalledTimes(5)
     expect(load).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps starting every other remote channel when one provider cannot auto-start', async () => {
+    // Each provider owns an independent switch, process and listener, so one
+    // provider that cannot come up used to abort this loop and take the whole
+    // plugin generation with it: LAN and every remaining remote channel were
+    // torn down and only the manual UI toggle could recover them.
+    const started = recordRemoteChannelStarts('tailscale')
+    const mounted = await mount()
+    expect(started).toEqual(['tailscale', 'cpolar', 'cloudflared', 'frp', 'origin', 'iroh'])
+    // The surviving channels stay reachable; the failure is confined to one provider.
+    const remote = await invoke(mounted.route, 'GET', '/api/mobile-access/remote/control')
+    expect(remote.status).toBe(200)
+    expect(JSON.parse(remote.body)).toMatchObject({ provider: 'tailscale', running: false })
+    await mounted.context.fiber.dispose()
+    const log = await readFile(join(mounted.directory, 'logs', 'dsh-mobile.log'), 'utf8')
+    expect(log).toContain('tailscale remote channel auto-start failed: tailscale_test_start_failure')
+  })
+
+  it('keeps starting every remote channel when the LAN gateway cannot auto-start', async () => {
+    // The controller turns a failed gateway start into its own retry schedule, so
+    // what still reaches the plugin is a non-start failure (an unreadable control
+    // file, controller state misuse). It must not take the remote channels down.
+    vi.spyOn(MobileAccessGatewayController.prototype, 'initialize').mockRejectedValue(new Error('lan_control_unreadable'))
+    const started = recordRemoteChannelStarts()
+    const mounted = await mount()
+    expect(started).toEqual(['tailscale', 'cpolar', 'cloudflared', 'frp', 'origin', 'iroh'])
+    // The LAN control surface stays usable instead of the whole plugin vanishing.
+    expect((await invoke(mounted.route, 'GET', '/api/mobile-access/lan/control')).status).toBe(200)
+    await mounted.context.fiber.dispose()
+    const log = await readFile(join(mounted.directory, 'logs', 'dsh-mobile.log'), 'utf8')
+    expect(log).toContain('LAN gateway auto-start failed: lan_control_unreadable')
+  })
+
+  it('logs the reason an enabled LAN gateway could not start', async () => {
+    // The controller schedules its own retry and tells the caller nothing, so the
+    // host log is the only place the real cause can surface. Occupy a port and let
+    // the plugin autostart its LAN listener on it.
+    const occupant = createServer()
+    await new Promise<void>(resolve => { occupant.listen(0, '127.0.0.1', resolve) })
+    try {
+      const occupiedPort = (occupant.address() as AddressInfo).port
+      const mounted = await mount(true, 3080, { listenPort: occupiedPort })
+      await mounted.context.fiber.dispose()
+      const log = await readFile(join(mounted.directory, 'logs', 'dsh-mobile.log'), 'utf8')
+      expect(log).toContain('LAN gateway start failed:')
+      expect(log).toContain('EADDRINUSE')
+    } finally {
+      await new Promise<void>(resolve => { occupant.close(() => resolve()) })
+    }
   })
 
   it('requires the WebServer, commands, and Connection services', () => {

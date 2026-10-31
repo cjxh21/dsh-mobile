@@ -473,6 +473,119 @@ describe('cloudflared named tunnel', () => {
     expect(args()).toEqual([])
   })
 
+  it('retries a port conflict by itself instead of giving up on the tunnel', async () => {
+    // The usual cause is the previous DSH process still holding the forward port;
+    // it frees within seconds, so a remembered-enabled tunnel has to come back.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const port = await freeLoopbackPort()
+      const conflict = Object.assign(new Error('listen EADDRINUSE: address already in use'), { code: 'EADDRINUSE' })
+      const seen: Array<{ origin: string; port: number }> = []
+      const createGateway = vi.fn(async (origin: string, listenPort: number): Promise<MobileAccessGateway> => {
+        // The first attempt hits the busy port; the retry finds it free.
+        if (seen.length === 0) {
+          seen.push({ origin, port: listenPort })
+          throw conflict
+        }
+        seen.push({ origin, port: listenPort })
+        return gateway(origin, listenPort)
+      })
+      const { controller, journal } = await fixture(createGateway, namedSettings(port))
+      const failed = await journal.waitFor(status => status.state === 'error')
+      expect(failed).toEqual({ enabled: true, state: 'error', errorCode: 'cloudflared_tunnel_port_unavailable' })
+      expect(createGateway).toHaveBeenCalledOnce()
+
+      // The retry body crosses real I/O (lstat, port reservation), so advance
+      // virtual time in steps that yield to the event loop until it lands.
+      for (let at = 0; at < 100 && createGateway.mock.calls.length < 2; at += 1) {
+        await vi.advanceTimersByTimeAsync(100)
+      }
+      expect(createGateway).toHaveBeenCalledTimes(2)
+      expect(controller.status()).toMatchObject({ enabled: true, state: 'connecting' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('backs off past a second failure and restarts at the fast end once ready', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      const port = await freeLoopbackPort()
+      const conflict = Object.assign(new Error('listen EADDRINUSE: address already in use'), { code: 'EADDRINUSE' })
+      let conflictsLeft = 2
+      const children: FakeChild[] = []
+      const journal = new StatusJournal()
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-mobile-cloudflared-retry-reset-'))
+      temporaryDirectories.push(directory)
+      const executable = join(directory, 'component', 'cloudflared.exe')
+      await mkdir(dirname(executable), { recursive: true })
+      await writeFile(executable, 'fake-cloudflared')
+      const createGateway = vi.fn(async (origin: string, listenPort: number): Promise<MobileAccessGateway> => {
+        if (conflictsLeft > 0) {
+          conflictsLeft -= 1
+          throw conflict
+        }
+        return gateway(origin, listenPort)
+      })
+      const controller = new CloudflaredController({
+        store: new MemoryControlStore(),
+        executable,
+        createGateway,
+        tunnel: { settings: () => namedSettings(port) },
+        onStatus: journal.publish,
+        spawnProcess: () => {
+          const child = new FakeChild()
+          children.push(child)
+          return child as unknown as ChildProcessWithoutNullStreams
+        },
+      })
+      controllers.push(controller)
+      await controller.initialize()
+      const failed = await journal.waitFor(status => status.state === 'error')
+      expect(failed.errorCode).toBe('cloudflared_tunnel_port_unavailable')
+      expect(createGateway).toHaveBeenCalledOnce()
+
+      // Each retry body crosses real I/O (lstat, port reservation), so advance
+      // virtual time in steps that yield to the event loop and report how much
+      // virtual time the pending backoff actually needed.
+      const advanceUntil = async (predicate: () => boolean, stepMs = 100, maxSteps = 400): Promise<number> => {
+        let elapsed = 0
+        while (!predicate() && elapsed < stepMs * maxSteps) {
+          await vi.advanceTimersByTimeAsync(stepMs)
+          elapsed += stepMs
+        }
+        return elapsed
+      }
+
+      // First retry keeps the 5 s delay and conflicts again.
+      const firstWait = await advanceUntil(() => createGateway.mock.calls.length >= 2)
+      expect(firstWait).toBeGreaterThanOrEqual(5_000)
+      expect(firstWait).toBeLessThan(15_000)
+      // The second attempt waited the 15 s step of the schedule, not 5 s again.
+      const secondWait = await advanceUntil(() => createGateway.mock.calls.length >= 3)
+      expect(secondWait).toBeGreaterThanOrEqual(15_000)
+      expect(secondWait).toBeLessThan(60_000)
+      expect(conflictsLeft).toBe(0)
+      expect(children).toHaveLength(1)
+
+      children[0]!.stderr.write('INF Registered tunnel connection connIndex=0 connection=645e1fe2-9ac7-4a17-bc65-4cc7be9d7d67\n')
+      await journal.waitFor(status => status.state === 'ready')
+
+      // The connector dies after a ready stretch: the schedule restarted at the
+      // fast end, so the replacement arrives after 5 s rather than 60 s.
+      children[0]!.exitCode = 1
+      children[0]!.emit('close', 1)
+      // The port-conflict errors are already journalled, so match the new code.
+      const failedAgain = await journal.waitFor(status => status.errorCode === 'cloudflared_exited')
+      expect(failedAgain.state).toBe('error')
+      const restartWait = await advanceUntil(() => children.length >= 2)
+      expect(restartWait).toBeGreaterThanOrEqual(5_000)
+      expect(restartWait).toBeLessThan(15_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('does not blame the port when the gateway fails for another reason', async () => {
     // A certificate, configuration, or permission failure reported as "port
     // unavailable" would send the user hunting for a conflict that does not exist.

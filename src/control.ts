@@ -20,6 +20,16 @@ export interface MobileAccessRuntime {
   close(): Promise<void>
 }
 
+/**
+ * Failure-restart backoff for an enabled LAN gateway whose startup failed —
+ * typically DSH booting before Wi-Fi/VPN has an address (EADDRNOTAVAIL) or the
+ * previous DSH process still holding the port (EADDRINUSE). Early retries are
+ * quick because those causes clear within seconds; the tail settles into a slow
+ * pulse so a persistent fault never becomes a busy loop. A successful start
+ * resets the schedule, and any explicit user transition cancels the retry.
+ */
+const LAN_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 60_000, 300_000]
+
 /** One address-specific runtime selected from the current LAN state. */
 export interface MobileAccessRuntimeSelection {
   readonly key: string
@@ -191,6 +201,10 @@ export class MobileAccessGatewayController {
   private closing = false
   private queue: Promise<void> = Promise.resolve()
   private closeTask: Promise<void> | undefined
+  private retryTimer: NodeJS.Timeout | undefined
+  private retryAttempts = 0
+  /** Bumped by every explicit transition; a pending retry compares against it. */
+  private epoch = 0
 
   constructor(
     private readonly store: MobileAccessControlStore,
@@ -203,7 +217,12 @@ export class MobileAccessGatewayController {
       if (this.initialized) throw new Error('mobile-access control is already initialized')
       if (this.closing) throw new Error('mobile-access control is closing')
       const state = await this.store.load()
-      if (state.enabled) this.runtime = await this.startRuntime()
+      // An enabled gateway that fails to boot (port still held by the previous
+      // DSH process, Wi-Fi/VPN not up yet) must come back on its own. Rejecting
+      // here used to leave the control routes unusable and the channel dead
+      // until the user re-toggled it by hand, so the failure only schedules the
+      // first retry and the controller still becomes operable below.
+      if (state.enabled) await this.startOrScheduleRetry(this.epoch)
       this.initialized = true
     })
   }
@@ -218,7 +237,14 @@ export class MobileAccessGatewayController {
     if (this.closing) return Promise.reject(new Error('mobile-access control is closing'))
     return this.enqueue(async () => {
       if (!this.initialized) throw new Error('mobile-access control is not initialized')
-      if (this.isRunning() === running) return
+      if (this.isRunning() === running) {
+        // A requested stop while the runtime is down (a failed boot with a retry
+        // pending) must still land the disabled preference and cancel the retry;
+        // otherwise the toggle silently does nothing.
+        if (running || !(await this.store.load()).enabled) return
+        await this.disable()
+        return
+      }
       if (running) {
         await this.enable()
       } else {
@@ -231,6 +257,7 @@ export class MobileAccessGatewayController {
   close(): Promise<void> {
     if (this.closeTask !== undefined) return this.closeTask
     this.closing = true
+    this.cancelRetry()
     this.closeTask = this.enqueue(async () => {
       const runtime = this.runtime
       if (runtime === undefined) return
@@ -241,6 +268,9 @@ export class MobileAccessGatewayController {
   }
 
   private async enable(): Promise<void> {
+    // An explicit enable is authoritative: it replaces any pending failed-start
+    // retry with this attempt, whose own failure surfaces to the caller.
+    this.cancelRetry()
     const candidate = await this.startRuntime()
     try {
       await this.store.save({ version: 1, enabled: true })
@@ -256,14 +286,18 @@ export class MobileAccessGatewayController {
   }
 
   private async disable(): Promise<void> {
+    // A user-requested disable wins even when no runtime ever came up: without
+    // this the pending failed-start retry would re-enable the channel behind the
+    // user's back. The rollback below re-arms the retry if the write fails.
+    this.cancelRetry()
     const previous = this.runtime
-    if (previous === undefined) return
-    await previous.close()
+    if (previous !== undefined) await previous.close()
     try {
       await this.store.save({ version: 1, enabled: false })
     } catch (error) {
       try {
-        this.runtime = await this.startRuntime()
+        if (previous !== undefined) this.runtime = await this.startRuntime()
+        else await this.startOrScheduleRetry(this.epoch)
       } catch (rollbackError) {
         this.runtime = undefined
         throw new AggregateError([error, rollbackError], 'disabling mobile access failed and runtime rollback also failed')
@@ -271,6 +305,50 @@ export class MobileAccessGatewayController {
       throw error
     }
     this.runtime = undefined
+  }
+
+  /**
+   * Establish the runtime for a remembered-enabled channel, scheduling the first
+   * retry instead of propagating a startup failure.
+   */
+  private async startOrScheduleRetry(generation: number): Promise<void> {
+    try {
+      this.runtime = await this.startRuntime()
+      this.retryAttempts = 0
+    } catch {
+      // The concrete causes (port still held by the previous DSH process,
+      // interface or address not ready yet) clear on their own, so the retry
+      // schedule is the recovery path rather than a caller-visible error.
+      this.scheduleRetry(generation)
+    }
+  }
+
+  /**
+   * Bring an enabled-but-failed gateway up later, backing off per
+   * {@link LAN_RETRY_DELAYS_MS}. The captured epoch invalidates the retry once an
+   * explicit transition (enable/disable/close) supersedes it.
+   */
+  private scheduleRetry(generation: number): void {
+    if (generation !== this.epoch || this.closing) return
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer)
+    const lastDelay = LAN_RETRY_DELAYS_MS[LAN_RETRY_DELAYS_MS.length - 1] ?? 300_000
+    const delay = LAN_RETRY_DELAYS_MS[Math.min(this.retryAttempts, LAN_RETRY_DELAYS_MS.length - 1)] ?? lastDelay
+    this.retryAttempts += 1
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined
+      void this.enqueue(async () => {
+        if (generation !== this.epoch || this.closing) return
+        await this.startOrScheduleRetry(generation)
+      })
+    }, delay)
+    this.retryTimer.unref()
+  }
+
+  /** Drop a pending failed-start retry; every explicit transition calls this. */
+  private cancelRetry(): void {
+    this.epoch += 1
+    if (this.retryTimer !== undefined) clearTimeout(this.retryTimer)
+    this.retryTimer = undefined
   }
 
   private enqueue(operation: () => Promise<void>): Promise<void> {
